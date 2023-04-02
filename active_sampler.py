@@ -35,6 +35,8 @@ parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
 parser.add_argument('-a', '--arch', default='resnet50',
                     help='model architecture')
+parser.add_argument('--epochs', default=40, type=int, metavar='N',
+                    help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
 parser.add_argument('-b', '--batch-size', default=256, type=int,
@@ -42,35 +44,43 @@ parser.add_argument('-b', '--batch-size', default=256, type=int,
                     help='mini-batch size (default: 256), this is the total '
                          'batch size of all GPUs on the current node when '
                          'using Data Parallel or Distributed Data Parallel')
+parser.add_argument('--lr', '--learning-rate', default=0.01, type=float,
+                    metavar='LR', help='initial learning rate', dest='lr')
+parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
+                    help='momentum')
+parser.add_argument('--wd', '--weight-decay', default=1e-4, type=float,
+                    metavar='W', help='weight decay (default: 1e-4)',
+                    dest='weight_decay')
 parser.add_argument('-p', '--print-freq', default=10, type=int,
                     metavar='N', help='print frequency (default: 10)')
+parser.add_argument('--resume', default='', type=str, metavar='PATH',
+                    help='path to latest checkpoint (default: none)')
 parser.add_argument('--resume-indices', default='', type=str, metavar='PATH',
                         help='path to latest selected indices (default: none)')
+parser.add_argument('--seed', default=None, type=int,
+                    help='seed for initializing training. ')
 parser.add_argument('--save', default='./output', type=str,
                     help='experiment output directory')
 parser.add_argument('--indices', default='./indices', type=str,
                     help='experiment input directory')
+parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
+                    help='evaluate model on validation set')
 parser.add_argument('--weights', dest='weights', type=str, required=True,
                     help='pre-trained model weights')
 parser.add_argument('--load_cache', action='store_true',
                     help='should the features be recomputed or loaded from the cache')
+parser.add_argument('--lr_schedule', type=str, default='30,60,90',
+                    help='lr drop schedule')
 parser.add_argument('--splits', type=str, default='',
                     help='splits of unlabeled data to be labeled')
 parser.add_argument('--name', type=str, default='',
-                    help='method of index sampling')
+                    help='name of method to do linear evaluation on.')
 parser.add_argument('--backbone', type=str, default='compress', 
                     help='name of method to do linear evaluation on.')
-parser.add_argument(
-    "--seed", default=None, type=int, help="seed for initializing training. "
-)
-
 
 def main():
 
     args = parser.parse_args()
-
-    if not os.path.exists(args.indices):
-        os.makedirs(args.indices)
 
     if args.dataset == "imagenet":
         args.num_images = 1281167
@@ -78,7 +88,6 @@ def main():
 
     elif args.dataset == "imagenet_lt":
         args.num_images = 115846
-        args.num_classes = 1000
 
     elif args.dataset == "cifar100":
         args.num_images = 50000
@@ -94,13 +103,6 @@ def main():
     if not os.path.exists(args.save):
         os.makedirs(args.save)
 
-    seed = int(args.seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    random.seed(seed)
-    # torch.cuda.manual_seed_all(seed)    
-    torch.use_deterministic_algorithms(True)
-
     main_worker(args)
 
 
@@ -109,8 +111,7 @@ def load_weights(model, wts_path, args):
         # each pre-trained model has a different output size
         # it's 128 for MoCoTeacher
         # and 2048 for swAVTeacher
-        # model.fc = nn.Linear(model.fc.weight.shape[1], 2048)
-        model.fc = nn.Linear(model.fc.weight.shape[1], 128)
+        model.fc = nn.Linear(model.fc.weight.shape[1], 2048)
         if os.path.exists(wts_path):
             print(f"=> loading {args.backbone} weights ")
             wts = torch.load(wts_path)
@@ -158,7 +159,6 @@ def load_weights(model, wts_path, args):
             print("=> loaded pre-trained model '{}'".format(wts_path))
         else:
             raise ValueError("=> no checkpoint found at '{}'".format(wts_path))
-    
 
 def get_model(arch, wts_path, args):
 
@@ -170,6 +170,7 @@ def get_model(arch, wts_path, args):
         p.requires_grad = False
 
     return model
+
 
 def get_inference_loader(dataset, all_indices, args):
     if dataset == "imagenet":
@@ -197,7 +198,7 @@ def get_inference_loader(dataset, all_indices, args):
                 transforms.CenterCrop(224),
                 transforms.ToTensor(),
                 normalize,
-            ])),
+            ]), all_indices),
             batch_size=args.batch_size, shuffle=False,
             num_workers=args.workers, pin_memory=True,
         )
@@ -226,16 +227,114 @@ def get_inference_loader(dataset, all_indices, args):
             num_workers=args.workers, pin_memory=True,
         )
 
-    elif dataset == "fashionmnist":
-        # normalize = transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
-        #                              std=[0.2470, 0.2435, 0.2616])
-        normalize = transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-        inference_loader = DataLoader(
-           FASHIONMNISTSubset(args.data, transforms.Compose([
+    else:
+        raise NotImplementedError
+
+    return inference_loader
+
+def get_train_loader(dataset, current_indices, args):
+    if dataset == "imagenet":
+        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                        std=[0.229, 0.224, 0.225])
+        train_loader = DataLoader(
+            ImageNetSubset(os.path.join(args.data, 'train'), 
+                transforms.Compose([
+                    transforms.RandomResizedCrop(224),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.ToTensor(),
+                    normalize,
+            ]), current_indices),
+            batch_size=args.batch_size, shuffle=True,
+            num_workers=args.workers, pin_memory=True,
+        )
+
+    elif dataset == "imagenet_lt":
+        in_lt_train_txt = './data/ImageNet_LT_train.txt'
+        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                         std=[0.229, 0.224, 0.225])
+        train_loader = DataLoader(
+            LT_Dataset(args.data, in_lt_train_txt, 
+                transforms.Compose([
+                    transforms.RandomResizedCrop(224),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.ToTensor(),
+                    normalize,
+            ]), current_indices),
+            batch_size=args.batch_size, shuffle=True,
+            num_workers=args.workers, pin_memory=True,
+        )
+
+    elif dataset == "cifar100":
+        normalize = transforms.Normalize(mean=[0.5071, 0.4865, 0.4409],
+                                     std=[0.2673, 0.2564, 0.2762])
+        train_loader = DataLoader(
+            CIFAR100Subset(args.data, transforms.Compose([
+                transforms.RandomResizedCrop(32),
+                transforms.RandomHorizontalFlip(),
                 transforms.ToTensor(),
-                transforms.Lambda(lambda x: x.repeat(3,1,1)),
                 normalize,
-            ]), all_indices),
+            ]), current_indices),
+            batch_size=args.batch_size, shuffle=True,
+            num_workers=args.workers, pin_memory=True,
+        )
+
+    elif dataset == "cifar10":
+        normalize = transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
+                                     std=[0.2470, 0.2435, 0.2616])
+        train_loader = DataLoader(
+            CIFAR10Subset(args.data, transforms.Compose([
+                transforms.RandomResizedCrop(32),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                normalize,
+            ]), current_indices),
+            batch_size=args.batch_size, shuffle=True,
+            num_workers=args.workers, pin_memory=True,
+        )
+
+
+    else:
+        raise NotImplementedError
+
+    return train_loader
+
+def get_val_loader(dataset, args):
+    if dataset == "imagenet" or dataset == "imagenet_lt":
+        valdir = os.path.join(args.data, 'val')
+        val_loader = torch.utils.data.DataLoader(
+            datasets.ImageFolder(valdir, transforms.Compose([
+                transforms.Resize(256),
+                transforms.CenterCrop(224),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                         std=[0.229, 0.224, 0.225])
+            ])),
+            batch_size=args.batch_size, shuffle=False,
+            num_workers=args.workers, pin_memory=True,
+        )
+
+    elif dataset == "cifar100":
+        val_loader = torch.utils.data.DataLoader(
+            datasets.CIFAR100(args.data, download=True, 
+            transform=transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.5071, 0.4865, 0.4409],
+                                    std=[0.2673, 0.2564, 0.2762])
+            ]), 
+            train=False),
+            batch_size=args.batch_size, shuffle=False,
+            num_workers=args.workers, pin_memory=True,
+        )
+
+    elif dataset == "cifar10":
+        val_loader = torch.utils.data.DataLoader(
+            datasets.CIFAR10(args.data, download=True, 
+            transform=transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
+                                    std=[0.2470, 0.2435, 0.2616])
+            ]), 
+            train=False),
             batch_size=args.batch_size, shuffle=False,
             num_workers=args.workers, pin_memory=True,
         )
@@ -243,7 +342,7 @@ def get_inference_loader(dataset, all_indices, args):
     else:
         raise NotImplementedError
 
-    return inference_loader
+    return val_loader
 
 def main_worker(args):
     all_indices = np.arange(args.num_images)
@@ -254,65 +353,71 @@ def main_worker(args):
 
     cudnn.benchmark = True
 
-    # get all dataset features and labels in eval mode
-    inference_feats, inference_labels = get_feats(args.dataset, inference_loader, backbone, args)
+    # get all dataset labels in eval mode
+    _, inference_labels = get_feats(args.dataset, inference_loader, backbone, args)
 
-    save_indices = None
-    current_indices = None
+    # validation data loading code
+    val_loader = get_val_loader(args.dataset, args)
+
+    # current indices loading
     if os.path.isfile(args.resume_indices):
         print("=> Loading current indices: {}".format(args.resume_indices))
         current_indices = np.load(args.resume_indices)
-        save_indices = np.load(args.resume_indices)
         print('current indices size: {}. {}% of all categories is seen'.format(len(current_indices), len(np.unique(inference_labels[current_indices])) / args.num_classes * 100))
 
-
-    splits = [0 if x=='' else int(float(x)) for x in args.splits.split(',')]
-
-    if args.name == "uniform":
-        print(f"Query sampling with {args.name} started ...")
-        strategies.uniform(inference_labels, splits, args)
-        return
-
-    if args.name == "random":
-        print(f"Query sampling with {args.name} started ...")
-        strategies.random(all_indices, inference_labels, splits, args)
-        return
-
+    splits = [int(x) for x in args.splits.split(',')]
     for split in splits:
+        # Training data loading code
+        train_loader = get_train_loader(args.dataset, current_indices, args)
 
-        # unlabeled_indices = np.setdiff1d(all_indices, current_indices)
-        unlabeled_indices = np.setdiff1d(all_indices, save_indices)
+        print("=> creating model")
+        linear = nn.Sequential(
+            # Normalize(),
+            nn.Linear(get_channels(args.arch), args.num_classes),
+        )
+        linear = linear.cuda()
+
+        # optimizer = torch.optim.SGD(linear.parameters(),
+        #                             args.lr,
+        #                             momentum=args.momentum,
+        #                             weight_decay=args.weight_decay)
+        optimizer = torch.optim.Adam(linear.parameters(),
+                                    args.lr)
+        
+        sched = [int(x) for x in args.lr_schedule.split(',')]
+        lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
+            optimizer, milestones=sched
+        )
+
+        cudnn.benchmark = True
+        print('Training task model started ...')
+        for epoch in range(args.start_epoch, args.epochs):
+            # train for one epoch
+            train(train_loader, backbone, linear, optimizer, epoch, args)
+
+            # evaluate on validation set
+            if epoch % args.print_freq == 0 or epoch == args.epochs-1:
+                acc1 = validate(val_loader, backbone, linear, args)
+
+            # modify lr
+            lr_scheduler.step()
+            print('LR: {:f}'.format(lr_scheduler.get_last_lr()[-1]))
+            
+        print('Final accuracy of {} labeled data is: {}'.format(len(current_indices), acc1))
+
+        unlabeled_indices = np.setdiff1d(all_indices, current_indices)
         print(f"Current unlabeled indices is {len(unlabeled_indices)}.")
 
-        if args.name == "kmeans":
+        if args.name == "entropy":
             print(f"Query sampling with {args.name} started ...")
-            current_indices = strategies.fast_kmeans(inference_feats, split, args)
+            unlabeled_loader = get_inference_loader(args.dataset, unlabeled_indices, args)
 
-        elif args.name == "accu_kmeans":
-            print(f"Query sampling with {args.name} started ...")
-            sampled_indices = strategies.accu_kmeans(inference_feats, split, unlabeled_indices, args)
+            sampled_indices = strategies.entropy(unlabeled_loader, unlabeled_indices, backbone, linear, split)
             current_indices = np.concatenate((current_indices, sampled_indices), axis=-1)
 
-        elif args.name == "coreset":
-            print(f"Query sampling with {args.name} started ...")
-            sampled_indices = strategies.core_set(inference_feats[unlabeled_indices], 
-                                                    inference_feats[current_indices],
-                                                    unlabeled_indices, 
-                                                    split, args)
-            current_indices = np.concatenate((current_indices, sampled_indices), axis=-1)
-
-        else:
-            raise NotImplementedError("Query sampling method is not implemented")
-        #########
-        # save_indices = np.append(save_indices,current_indices)
-        # print('{} inidices are sampled in total, {} of them are unique'.format(len(save_indices), len(np.unique(save_indices))))
-        # print('{}% of all categories is seen'.format(len(np.unique(inference_labels[current_indices]))/args.num_classes * 100))
-        # np.save(f'{args.indices}/{args.name}_{args.dataset}_{len(save_indices)}.npy', save_indices)
-        #######
         print('{} inidices are sampled in total, {} of them are unique'.format(len(current_indices), len(np.unique(current_indices))))
         print('{}% of all categories is seen'.format(len(np.unique(inference_labels[current_indices]))/args.num_classes * 100))
         np.save(f'{args.indices}/{args.name}_{args.dataset}_{len(current_indices)}.npy', current_indices)
-
 
 class Normalize(nn.Module):
     def forward(self, x):
@@ -347,14 +452,104 @@ def get_channels(arch):
     return c
 
 
+def train(train_loader, backbone, linear, optimizer, epoch, args):
+    batch_time = AverageMeter('Time', ':6.3f')
+    data_time = AverageMeter('Data', ':6.3f')
+    losses = AverageMeter('Loss', ':.4e')
+    top1 = AverageMeter('Acc@1', ':6.2f')
+    top5 = AverageMeter('Acc@5', ':6.2f')
+    progress = ProgressMeter(
+        len(train_loader),
+        [batch_time, data_time, losses, top1, top5],
+        prefix="Epoch: [{}]".format(epoch))
+
+    backbone.eval()
+    linear.train()
+
+    end = time.time()
+    for i, (images, target, _) in enumerate(train_loader):
+        # measure data loading time
+        data_time.update(time.time() - end)
+
+        images = images.cuda(non_blocking=True)
+        target = target.cuda(non_blocking=True)
+
+        # compute output
+        with torch.no_grad():
+            output = backbone(images)
+        output = linear(output)
+        loss = F.cross_entropy(output, target)
+
+        # measure accuracy and record loss
+        acc1, acc5 = accuracy(output, target, topk=(1, 5))
+        losses.update(loss.item(), images.size(0))
+        top1.update(acc1[0], images.size(0))
+        top5.update(acc5[0], images.size(0))
+
+        # compute gradient and do step
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+        if i % args.print_freq == 0:
+            progress.display(i)
+
+
+def validate(val_loader, backbone, linear, args):
+    batch_time = AverageMeter('Time', ':6.3f')
+    losses = AverageMeter('Loss', ':.4e')
+    top1 = AverageMeter('Acc@1', ':6.2f')
+    top5 = AverageMeter('Acc@5', ':6.2f')
+    progress = ProgressMeter(
+        len(val_loader),
+        [batch_time, losses, top1, top5],
+        prefix='Test: ')
+
+    backbone.eval()
+    linear.eval()
+
+    with torch.no_grad():
+        end = time.time()
+        for i, (images, target) in enumerate(val_loader):
+            images = images.cuda(non_blocking=True)
+            target = target.cuda(non_blocking=True)
+
+            # compute output
+            output = backbone(images)
+            output = linear(output)
+            loss = F.cross_entropy(output, target)
+
+            # measure accuracy and record loss
+            acc1, acc5 = accuracy(output, target, topk=(1, 5))
+            losses.update(loss.item(), images.size(0))
+            top1.update(acc1[0], images.size(0))
+            top5.update(acc5[0], images.size(0))
+
+            # measure elapsed time
+            batch_time.update(time.time() - end)
+            end = time.time()
+
+            if i % args.print_freq == 0:
+                progress.display(i)
+
+        # TODO: this should also be done with the ProgressMeter
+        print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
+              .format(top1=top1, top5=top5))
+
+    return top1.avg
+
+
 def normalize(x):
     return x / x.norm(2, dim=1, keepdim=True)
 
 
 def get_feats(dataset, loader, model, args):
     if args.backbone == "compress":
-        cached_feats = '/root/autodl-tmp/pycode/{}/inference_feats_{}_compress18_swAVTeacher.pth.tar'.format(args.save, dataset)
-
+        cached_feats = '{}/inference_feats_{}_compress18_{}Teacher.pth.tar'.format(args.save, dataset, "MoCo" if "MoCo" in args.weights else "swAV")
     elif args.backbone == "moco":
         cached_feats = '{}/inference_feats_{}_moco.pth.tar'.format(args.save, dataset)
 
@@ -385,7 +580,6 @@ def get_feats(dataset, loader, model, args):
 
         torch.save((feats, labels), cached_feats)
         return feats, labels
-
 
 class AverageMeter(object):
     """Computes and stores the average and current value"""

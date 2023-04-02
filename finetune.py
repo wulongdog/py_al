@@ -1,5 +1,3 @@
-#!/usr/bin/env python
-# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 import argparse
 import os
 import random
@@ -24,6 +22,7 @@ import torch.nn.functional as F
 
 import numpy as np
 
+import strategies
 from custom_datasets import *
 
 
@@ -47,6 +46,8 @@ parser.add_argument('-b', '--batch-size', default=256, type=int,
                          'using Data Parallel or Distributed Data Parallel')
 parser.add_argument('--lr', '--learning-rate', default=0.01, type=float,
                     metavar='LR', help='initial learning rate', dest='lr')
+parser.add_argument('--lr-lin', default=0.01, type=float,
+                    metavar='LR', help='initial learning rate', dest='lr_lin')
 parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
                     help='momentum')
 parser.add_argument('--wd', '--weight-decay', default=1e-4, type=float,
@@ -56,6 +57,8 @@ parser.add_argument('-p', '--print-freq', default=10, type=int,
                     metavar='N', help='print frequency (default: 10)')
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
+parser.add_argument('--resume-indices', default='', type=str, metavar='PATH',
+                        help='path to latest selected indices (default: none)')
 parser.add_argument('--seed', default=None, type=int,
                     help='seed for initializing training. ')
 parser.add_argument('--save', default='./output', type=str,
@@ -64,12 +67,73 @@ parser.add_argument('--indices', default='./indices', type=str,
                     help='experiment input directory')
 parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
                     help='evaluate model on validation set')
+parser.add_argument('--weights', dest='weights', type=str, required=True,
+                    help='pre-trained model weights')
 parser.add_argument('--lr_schedule', type=str, default='30,60,90',
                     help='lr drop schedule')
 parser.add_argument('--splits', type=str, default='',
                     help='splits of unlabeled data to be labeled')
 parser.add_argument('--name', type=str, default='',
                     help='name of method to do linear evaluation on.')
+
+def main():
+
+    args = parser.parse_args()
+
+    if args.dataset == "imagenet":
+        args.num_images = 1281167
+        args.num_classes = 1000
+
+    else:
+        raise NotImplementedError
+
+    if not os.path.exists(args.save):
+        os.makedirs(args.save)
+    
+    main_worker(args)
+
+
+def load_weights(model, wts_path, args):
+    # each pre-trained model has a different output size
+    # it's 128 for MoCoTeacher
+    # and 2048 for swAVTeacher
+    model.fc = nn.Linear(model.fc.weight.shape[1], 128)
+    if os.path.exists(wts_path):
+        print("=> loading weights ")
+        wts = torch.load(wts_path)
+        if 'state_dict' in wts:
+            ckpt = wts['state_dict']
+        if 'model' in wts:
+            ckpt = wts['model']
+        else:
+            ckpt = wts
+
+        ckpt = {k.replace('module.', ''): v for k, v in ckpt.items()}
+        state_dict = {}
+
+        for m_key, m_val in model.state_dict().items():
+            if m_key in ckpt:
+                state_dict[m_key] = ckpt[m_key]
+            else:
+                state_dict[m_key] = m_val
+                print('not copied => ' + m_key)
+
+        model.load_state_dict(state_dict)
+        print("Weights loaded.")
+    else:
+        raise ValueError("=> no checkpoint found at '{}'".format(wts_path))
+
+def get_model(arch, wts_path, args):
+
+    model = models.__dict__[arch]()
+    load_weights(model, wts_path, args)
+    model.fc = nn.Sequential(
+            Normalize(),
+            nn.Linear(get_channels(args.arch), args.num_classes),
+        )
+
+    return model
+
 
 def get_train_loader(dataset, current_indices, args):
     if dataset == "imagenet":
@@ -82,47 +146,6 @@ def get_train_loader(dataset, current_indices, args):
                     transforms.RandomHorizontalFlip(),
                     transforms.ToTensor(),
                     normalize,
-            ]), current_indices),
-            batch_size=args.batch_size, shuffle=True,
-            num_workers=args.workers, pin_memory=True,
-        )
-
-    elif dataset == "cifar100":
-        normalize = transforms.Normalize(mean=[0.5071, 0.4865, 0.4409],
-                                     std=[0.2673, 0.2564, 0.2762])
-        train_loader = DataLoader(
-            CIFAR100Subset(args.data, transforms.Compose([
-                transforms.RandomResizedCrop(32),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                normalize,
-            ]), current_indices),
-            batch_size=args.batch_size, shuffle=True,
-            num_workers=args.workers, pin_memory=True,
-        )
-
-    elif dataset == "cifar10":
-        normalize = transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
-                                     std=[0.2470, 0.2435, 0.2616])
-        train_loader = DataLoader(
-            CIFAR10Subset(args.data, transforms.Compose([
-                transforms.RandomResizedCrop(32),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                normalize,
-            ]), current_indices),
-            batch_size=args.batch_size, shuffle=True,
-            num_workers=args.workers, pin_memory=True,
-        )
-    elif dataset == "fashionmnist":
-        normalize = transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-        train_loader = DataLoader(
-            FASHIONMNISTSubset(args.data, transforms.Compose([
-                transforms.RandomResizedCrop(32),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                transforms.Lambda(lambda x: x.repeat(3,1,1)),
-                normalize,
             ]), current_indices),
             batch_size=args.batch_size, shuffle=True,
             num_workers=args.workers, pin_memory=True,
@@ -148,169 +171,94 @@ def get_val_loader(dataset, args):
             num_workers=args.workers, pin_memory=True,
         )
 
-    elif dataset == "cifar100":
-        val_loader = torch.utils.data.DataLoader(
-            datasets.CIFAR100(args.data, download=True, 
-            transform=transforms.Compose([
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.5071, 0.4865, 0.4409],
-                                    std=[0.2673, 0.2564, 0.2762])
-            ]), 
-            train=False),
-            batch_size=args.batch_size, shuffle=False,
-            num_workers=args.workers, pin_memory=True,
-        )
-    
-    elif dataset == "cifar10":
-        val_loader = torch.utils.data.DataLoader(
-            datasets.CIFAR10(args.data, download=True, 
-            transform=transforms.Compose([
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
-                                    std=[0.2470, 0.2435, 0.2616])
-            ]), 
-            train=False),
-            batch_size=args.batch_size, shuffle=False,
-            num_workers=args.workers, pin_memory=True,
-        )
-
-    elif dataset == "fashionmnist":
-        val_loader = torch.utils.data.DataLoader(
-            datasets.FashionMNIST(args.data, download=True, 
-            transform=transforms.Compose([
-                transforms.ToTensor(),
-                transforms.Lambda(lambda x: x.repeat(3,1,1)),
-                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-            ]), 
-            train=False),
-            batch_size=args.batch_size, shuffle=False,
-            num_workers=args.workers, pin_memory=True,
-        )
-
     else:
         raise NotImplementedError
 
     return val_loader
 
-def main():
-
-    args = parser.parse_args()
-
-    if args.dataset == "imagenet":
-        args.num_images = 1281167
-        args.num_classes = 1000
-
-    elif args.dataset == "cifar100":
-        args.num_images = 50000
-        args.num_classes = 100
-
-    elif args.dataset == "cifar10":
-        args.num_images = 50000
-        args.num_classes = 100
-
-    else:
-        raise NotImplementedError
-
-    seed = int(args.seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    random.seed(seed)
-    # torch.cuda.manual_seed_all(seed)    
-    torch.use_deterministic_algorithms(True)
-
-    print("=> creating model")
-    task_model = models.__dict__[args.arch](num_classes=args.num_classes)
-    task_model = torch.nn.DataParallel(task_model).cuda()
-
-    optimizer = torch.optim.SGD(task_model.parameters(), args.lr,
-                                momentum=args.momentum,
-                                weight_decay=args.weight_decay)
-
-    sched = [int(x) for x in args.lr_schedule.split(',')]
-    lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
-        optimizer, milestones=sched
-    )
-
-    if args.resume:
-        if os.path.isfile(args.resume):
-            print("=> loading checkpoint '{}'".format(args.resume))
-
-            checkpoint = torch.load(args.resume)
-
-            args.start_epoch = checkpoint['epoch']
-            best_acc1 = checkpoint['best_acc1']
-            acc1 = checkpoint['best_acc1']
-            task_model.load_state_dict(checkpoint['state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            print("=> loaded checkpoint '{}' (epoch {})"
-                  .format(args.resume, checkpoint['epoch']))
-        else:
-            print("=> no checkpoint found at '{}'".format(args.resume))
-
-    # validation data loading code
-    val_loader = get_val_loader(args.dataset, args)
+def main_worker(args):    
 
     splits = [int(x) for x in args.splits.split(',')]
-    args.start_epoch = 0
+
+    #validation data loading code
+    val_loader = get_val_loader(args.dataset, args)
+
     for split in splits:
-        best_acc1 = 0
 
-        cudnn.benchmark = True
+        backbone = get_model(args.arch, args.weights, args)
+        backbone = nn.DataParallel(backbone).cuda()
 
-        # current indices loading
+        optimizer = torch.optim.Adam([ {'params':list(backbone.parameters())[:-2]} , {'params':backbone.module.fc.parameters(), 'lr':args.lr_lin}],
+                                    args.lr
+                                    )
+
+        sched = [int(x) for x in args.lr_schedule.split(',')]
+        lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
+            optimizer, milestones=sched
+        )
+
+        # training data loading code
         curr_idxs_file = '{}/{}_{}_{}.npy'.format(args.indices, args.name, args.dataset, split)
         if os.path.isfile(curr_idxs_file):
             print("=> Loading current indices: {}".format(curr_idxs_file))
             current_indices = np.load(curr_idxs_file)
             print('current indices size: {}.'.format(len(current_indices)))
         else:
-            print("=> no such file found at '{}'".format(curr_idxs_file))
+            raise RuntimeError("=> no such file found at '{}'".format(curr_idxs_file))
 
-        # Training data loading code
         train_loader = get_train_loader(args.dataset, current_indices, args)
 
+        cudnn.benchmark = True
         print('Training task model started ...')
-        print('start epoch is{} and epoch is {}'.format(args.start_epoch, args.epochs))
-        classifier = nn.Linear(task_model.fc.in_features, args.num_classes)
-        task_model.fc = torch.nn.Sequential()
         for epoch in range(args.start_epoch, args.epochs):
             # train for one epoch
-            train(train_loader, task_model, optimizer, epoch, args)
+            train(train_loader, backbone, optimizer, epoch, args)
 
             # evaluate on validation set
-            if epoch % 10 == 0 or epoch == args.epochs-1:
-                acc1 = validate(task_model, val_loader, args)
-                # remember best acc@1 and save checkpoint
-                best_acc1 = max(acc1, best_acc1)
+            if epoch % args.print_freq == 0 or epoch == args.epochs-1:
+                acc1 = validate(val_loader, backbone, args)
 
-                save_checkpoint({
-                    'epoch': epoch + 1,
-                    'state_dict': task_model.state_dict(),
-                    'best_acc1': best_acc1,
-                    'optimizer' : optimizer.state_dict(),
-                }, '{}_{}_{}.pth.tar'.format(args.name, args.dataset, split))
-            
+            # modify lr
             lr_scheduler.step()
-            print('LR: {:f}'.format(lr_scheduler.get_last_lr()[-1]))    
-
-        print('Final accuracy of {} labeled data is: {:.2f}'.format(split, acc1))
-
-        print("=> creating model from scratch for the new split ...")
-        task_model = models.__dict__[args.arch](num_classes=args.num_classes)
-        task_model = torch.nn.DataParallel(task_model).cuda()
-
-        args.start_epoch = 0
-        optimizer = torch.optim.SGD(task_model.parameters(), args.lr,
-                                    momentum=args.momentum,
-                                    weight_decay=args.weight_decay)
-        
-        lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
-            optimizer, milestones=sched
-        )
+            print('Base LR: {:f}, FC LR: {:f}'.format(lr_scheduler.get_last_lr()[0], lr_scheduler.get_last_lr()[1]))
+            
+        print('Final accuracy of {} labeled data is: {}'.format(split, acc1))
 
 
+class Normalize(nn.Module):
+    def forward(self, x):
+        return x / x.norm(2, dim=1, keepdim=True)
 
-def train(train_loader, task_model, optimizer, epoch, args):
+
+class FullBatchNorm(nn.Module):
+    def __init__(self, var, mean):
+        super(FullBatchNorm, self).__init__()
+        self.register_buffer('inv_std', (1.0 / torch.sqrt(var + 1e-5)))
+        self.register_buffer('mean', mean)
+
+    def forward(self, x):
+        return (x - self.mean) * self.inv_std
+
+
+def get_channels(arch):
+    if arch == 'alexnet':
+        c = 4096
+    elif arch == 'pt_alexnet':
+        c = 4096
+    elif arch == 'resnet50':
+        c = 2048
+    elif arch == 'resnet18':
+        c = 512
+    elif arch == 'mobilenet':
+        c = 1280
+    elif arch == 'resnet50x5_swav':
+        c = 10240
+    else:
+        raise ValueError('arch not found: ' + arch)
+    return c
+
+
+def train(train_loader, backbone, optimizer, epoch, args):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
@@ -321,12 +269,11 @@ def train(train_loader, task_model, optimizer, epoch, args):
         [batch_time, data_time, losses, top1, top5],
         prefix="Epoch: [{}]".format(epoch))
 
-    task_model.train()
+    # switch to train mode
+    backbone.train()
 
     end = time.time()
-
     for i, (images, target, _) in enumerate(train_loader):
-        
         # measure data loading time
         data_time.update(time.time() - end)
 
@@ -334,7 +281,7 @@ def train(train_loader, task_model, optimizer, epoch, args):
         target = target.cuda(non_blocking=True)
 
         # compute output
-        output = task_model(images)
+        output = backbone(images)
         loss = F.cross_entropy(output, target)
 
         # measure accuracy and record loss
@@ -356,7 +303,7 @@ def train(train_loader, task_model, optimizer, epoch, args):
             progress.display(i)
 
 
-def validate(task_model, val_loader, args):
+def validate(val_loader, backbone, args):
     batch_time = AverageMeter('Time', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
     top1 = AverageMeter('Acc@1', ':6.2f')
@@ -366,8 +313,7 @@ def validate(task_model, val_loader, args):
         [batch_time, losses, top1, top5],
         prefix='Test: ')
 
-    # switch to evaluate mode
-    task_model.eval()
+    backbone.eval()
 
     with torch.no_grad():
         end = time.time()
@@ -376,7 +322,7 @@ def validate(task_model, val_loader, args):
             target = target.cuda(non_blocking=True)
 
             # compute output
-            output = task_model(images)
+            output = backbone(images)
             loss = F.cross_entropy(output, target)
 
             # measure accuracy and record loss
@@ -392,15 +338,14 @@ def validate(task_model, val_loader, args):
             if i % args.print_freq == 0:
                 progress.display(i)
 
-        # TODO: this should also be done with the ProgressMeter
         print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
               .format(top1=top1, top5=top5))
 
     return top1.avg
 
-    
-def save_checkpoint(state, filename='checkpoint.pth.tar'):
-    torch.save(state, filename)
+
+def normalize(x):
+    return x / x.norm(2, dim=1, keepdim=True)
 
 
 class AverageMeter(object):
@@ -443,6 +388,7 @@ class ProgressMeter(object):
         fmt = '{:' + str(num_digits) + 'd}'
         return '[' + fmt + '/' + fmt.format(num_batches) + ']'
 
+
 def accuracy(output, target, topk=(1,)):
     """Computes the accuracy over the k top predictions for the specified values of k"""
     with torch.no_grad():
@@ -459,6 +405,8 @@ def accuracy(output, target, topk=(1,)):
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
 
+def save_checkpoint(state, filename='checkpoint.pth.tar'):
+    torch.save(state, filename)
 
 if __name__ == '__main__':
     main()
