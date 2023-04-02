@@ -1,5 +1,3 @@
-#!/usr/bin/env python
-# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 import argparse
 import os
 import random
@@ -24,6 +22,7 @@ import torch.nn.functional as F
 
 import numpy as np
 
+import strategies
 from custom_datasets import *
 
 
@@ -64,12 +63,175 @@ parser.add_argument('--indices', default='./indices', type=str,
                     help='experiment input directory')
 parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
                     help='evaluate model on validation set')
+parser.add_argument('--weights', default='', dest='weights', type=str,
+                    help='pre-trained model weights')
+parser.add_argument('--load_cache', action='store_true',
+                    help='should the features be recomputed or loaded from the cache')
 parser.add_argument('--lr_schedule', type=str, default='30,60,90',
                     help='lr drop schedule')
 parser.add_argument('--splits', type=str, default='',
                     help='splits of unlabeled data to be labeled')
 parser.add_argument('--name', type=str, default='',
                     help='name of method to do linear evaluation on.')
+parser.add_argument('--backbone', type=str, default='compress', 
+                    help='name of method to do linear evaluation on.')
+
+
+def main():
+
+    args = parser.parse_args()
+
+    if args.dataset == "imagenet":
+        args.num_images = 1281167
+        args.num_classes = 1000
+
+    elif args.dataset == "imagenet_lt":
+        args.num_images = 115846
+        args.num_classes = 1000
+
+    elif args.dataset == "cifar100":
+        args.num_images = 50000
+        args.num_classes = 100
+
+    elif args.dataset == "cifar10":
+        args.num_images = 50000
+        args.num_classes = 10
+
+    else:
+        raise NotImplementedError
+
+    if not os.path.exists(args.save):
+        os.makedirs(args.save)
+
+    main_worker(args)
+
+
+def load_weights(model, wts_path, args):
+    if args.backbone == "compress":
+        # each pre-trained model has a different output size
+        # it's 128 for MoCoTeacher
+        # and 2048 for swAVTeacher
+        model.fc = nn.Linear(model.fc.weight.shape[1], 128 if "MoCo" in wts_path else 2048)
+        if os.path.exists(wts_path):
+            print(f"=> loading weights from {args.backbone}")
+            wts = torch.load(wts_path)
+            if 'state_dict' in wts:
+                ckpt = wts['state_dict']
+            if 'model' in wts:
+                ckpt = wts['model']
+            else:
+                ckpt = wts
+
+            ckpt = {k.replace('module.', ''): v for k, v in ckpt.items()}
+            state_dict = {}
+
+            for m_key, m_val in model.state_dict().items():
+                if m_key in ckpt:
+                    state_dict[m_key] = ckpt[m_key]
+                else:
+                    state_dict[m_key] = m_val
+                    print('not copied => ' + m_key)
+
+            model.load_state_dict(state_dict)
+            
+            print(f"Weights of {args.backbone} loaded.")
+        else:
+            raise ValueError("=> no checkpoint found at '{}'".format(wts_path))
+
+    elif args.backbone == "moco":
+        if os.path.isfile(wts_path):
+            print("=> loading checkpoint '{}'".format(wts_path))
+            checkpoint = torch.load(wts_path, map_location="cpu")
+
+            # rename moco pre-trained keys
+            state_dict = checkpoint['state_dict']
+            for k in list(state_dict.keys()):
+                # retain only encoder_q up to before the embedding layer
+                if k.startswith('module.encoder_q') and not k.startswith('module.encoder_q.fc'):
+                    # remove prefix
+                    state_dict[k[len("module.encoder_q."):]] = state_dict[k]
+                # delete renamed or unused k
+                del state_dict[k]
+
+            args.start_epoch = 0
+            
+            msg = model.load_state_dict(state_dict, strict=False)
+            assert set(msg.missing_keys) == {"fc.weight", "fc.bias"}, msg.missing_keys
+
+            print("=> loaded pre-trained model '{}'".format(wts_path))
+        else:
+            raise ValueError("=> no checkpoint found at '{}'".format(wts_path))
+
+def get_model(arch, wts_path, args):
+    model = models.__dict__[arch]()
+    load_weights(model, wts_path, args)
+    model.fc = nn.Sequential()
+
+    for p in model.parameters():
+        p.requires_grad = False
+
+    return model
+
+
+def get_inference_loader(dataset, all_indices, args):
+    if dataset == "imagenet":
+        traindir = os.path.join(args.data, 'train')
+        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                         std=[0.229, 0.224, 0.225])
+        inference_loader = DataLoader(
+            ImageNetSubset(traindir, transforms.Compose([
+                transforms.Resize(256),
+                transforms.CenterCrop(224),
+                transforms.ToTensor(),
+                normalize,
+            ]), all_indices),
+            batch_size=args.batch_size, shuffle=False,
+            num_workers=args.workers, pin_memory=True,
+        )
+
+    elif dataset == "imagenet_lt":
+        in_lt_train_txt = './data/ImageNet_LT_train.txt'
+        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                         std=[0.229, 0.224, 0.225])
+        inference_loader = DataLoader(
+            LT_Dataset(args.data, in_lt_train_txt, transforms.Compose([
+                transforms.Resize(256),
+                transforms.CenterCrop(224),
+                transforms.ToTensor(),
+                normalize,
+            ])),
+            batch_size=args.batch_size, shuffle=False,
+            num_workers=args.workers, pin_memory=True,
+        )
+
+    elif dataset == "cifar100":
+        normalize = transforms.Normalize(mean=[0.5071, 0.4865, 0.4409],
+                                     std=[0.2673, 0.2564, 0.2762])
+        inference_loader = DataLoader(
+            CIFAR100Subset(args.data, transforms.Compose([
+                transforms.ToTensor(),
+                normalize,
+            ]), all_indices),
+            batch_size=args.batch_size, shuffle=False,
+            num_workers=args.workers, pin_memory=True,
+        )
+
+    elif dataset == "cifar10":
+        normalize = transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
+                                     std=[0.2470, 0.2435, 0.2616])
+        inference_loader = DataLoader(
+            CIFAR10Subset(args.data, transforms.Compose([
+                transforms.ToTensor(),
+                normalize,
+            ]), all_indices),
+            batch_size=args.batch_size, shuffle=False,
+            num_workers=args.workers, pin_memory=True,
+        )
+
+    else:
+        raise NotImplementedError
+
+    return inference_loader
 
 def get_train_loader(dataset, current_indices, args):
     if dataset == "imagenet":
@@ -77,6 +239,22 @@ def get_train_loader(dataset, current_indices, args):
                                         std=[0.229, 0.224, 0.225])
         train_loader = DataLoader(
             ImageNetSubset(os.path.join(args.data, 'train'), 
+                transforms.Compose([
+                    transforms.RandomResizedCrop(224),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.ToTensor(),
+                    normalize,
+            ]), current_indices),
+            batch_size=args.batch_size, shuffle=True,
+            num_workers=args.workers, pin_memory=True,
+        )
+
+    elif dataset == "imagenet_lt":
+        in_lt_train_txt = './data/ImageNet_LT_train.txt'
+        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                         std=[0.229, 0.224, 0.225])
+        train_loader = DataLoader(
+            LT_Dataset(args.data, in_lt_train_txt, 
                 transforms.Compose([
                     transforms.RandomResizedCrop(224),
                     transforms.RandomHorizontalFlip(),
@@ -114,19 +292,7 @@ def get_train_loader(dataset, current_indices, args):
             batch_size=args.batch_size, shuffle=True,
             num_workers=args.workers, pin_memory=True,
         )
-    elif dataset == "fashionmnist":
-        normalize = transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-        train_loader = DataLoader(
-            FASHIONMNISTSubset(args.data, transforms.Compose([
-                transforms.RandomResizedCrop(32),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                transforms.Lambda(lambda x: x.repeat(3,1,1)),
-                normalize,
-            ]), current_indices),
-            batch_size=args.batch_size, shuffle=True,
-            num_workers=args.workers, pin_memory=True,
-        )
+
 
     else:
         raise NotImplementedError
@@ -134,7 +300,7 @@ def get_train_loader(dataset, current_indices, args):
     return train_loader
 
 def get_val_loader(dataset, args):
-    if dataset == "imagenet":
+    if dataset == "imagenet" or dataset == "imagenet_lt":
         valdir = os.path.join(args.data, 'val')
         val_loader = torch.utils.data.DataLoader(
             datasets.ImageFolder(valdir, transforms.Compose([
@@ -160,7 +326,7 @@ def get_val_loader(dataset, args):
             batch_size=args.batch_size, shuffle=False,
             num_workers=args.workers, pin_memory=True,
         )
-    
+
     elif dataset == "cifar10":
         val_loader = torch.utils.data.DataLoader(
             datasets.CIFAR10(args.data, download=True, 
@@ -174,143 +340,111 @@ def get_val_loader(dataset, args):
             num_workers=args.workers, pin_memory=True,
         )
 
-    elif dataset == "fashionmnist":
-        val_loader = torch.utils.data.DataLoader(
-            datasets.FashionMNIST(args.data, download=True, 
-            transform=transforms.Compose([
-                transforms.ToTensor(),
-                transforms.Lambda(lambda x: x.repeat(3,1,1)),
-                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-            ]), 
-            train=False),
-            batch_size=args.batch_size, shuffle=False,
-            num_workers=args.workers, pin_memory=True,
-        )
-
     else:
         raise NotImplementedError
 
     return val_loader
 
-def main():
+def main_worker(args):
+    all_indices = np.arange(args.num_images)
 
-    args = parser.parse_args()
+    inference_loader = get_inference_loader(args.dataset, all_indices, args)
+    backbone = get_model(args.arch, args.weights, args)
+    backbone = nn.DataParallel(backbone).cuda()
 
-    if args.dataset == "imagenet":
-        args.num_images = 1281167
-        args.num_classes = 1000
+    cudnn.benchmark = True
 
-    elif args.dataset == "cifar100":
-        args.num_images = 50000
-        args.num_classes = 100
-
-    elif args.dataset == "cifar10":
-        args.num_images = 50000
-        args.num_classes = 100
-
-    else:
-        raise NotImplementedError
-
-    seed = int(args.seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    random.seed(seed)
-    # torch.cuda.manual_seed_all(seed)    
-    torch.use_deterministic_algorithms(True)
-
-    print("=> creating model")
-    task_model = models.__dict__[args.arch](num_classes=args.num_classes)
-    task_model = torch.nn.DataParallel(task_model).cuda()
-
-    optimizer = torch.optim.SGD(task_model.parameters(), args.lr,
-                                momentum=args.momentum,
-                                weight_decay=args.weight_decay)
-
-    sched = [int(x) for x in args.lr_schedule.split(',')]
-    lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
-        optimizer, milestones=sched
-    )
-
-    if args.resume:
-        if os.path.isfile(args.resume):
-            print("=> loading checkpoint '{}'".format(args.resume))
-
-            checkpoint = torch.load(args.resume)
-
-            args.start_epoch = checkpoint['epoch']
-            best_acc1 = checkpoint['best_acc1']
-            acc1 = checkpoint['best_acc1']
-            task_model.load_state_dict(checkpoint['state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            print("=> loaded checkpoint '{}' (epoch {})"
-                  .format(args.resume, checkpoint['epoch']))
-        else:
-            print("=> no checkpoint found at '{}'".format(args.resume))
+    # get all dataset labels in eval mode
+    _, inference_labels = get_feats(args.dataset, inference_loader, backbone, args)
 
     # validation data loading code
     val_loader = get_val_loader(args.dataset, args)
 
     splits = [int(x) for x in args.splits.split(',')]
-    args.start_epoch = 0
     for split in splits:
-        best_acc1 = 0
-
-        cudnn.benchmark = True
 
         # current indices loading
         curr_idxs_file = '{}/{}_{}_{}.npy'.format(args.indices, args.name, args.dataset, split)
         if os.path.isfile(curr_idxs_file):
             print("=> Loading current indices: {}".format(curr_idxs_file))
             current_indices = np.load(curr_idxs_file)
-            print('current indices size: {}.'.format(len(current_indices)))
+            print('current indices size: {}. {}% of all categories is seen'.format(len(current_indices), len(np.unique(inference_labels[current_indices])) / args.num_classes * 100))
         else:
-            print("=> no such file found at '{}'".format(curr_idxs_file))
+            raise ValueError("=> no index file found at '{}'".format(curr_idxs_file))
 
         # Training data loading code
         train_loader = get_train_loader(args.dataset, current_indices, args)
 
-        print('Training task model started ...')
-        print('start epoch is{} and epoch is {}'.format(args.start_epoch, args.epochs))
-        classifier = nn.Linear(task_model.fc.in_features, args.num_classes)
-        task_model.fc = torch.nn.Sequential()
-        for epoch in range(args.start_epoch, args.epochs):
-            # train for one epoch
-            train(train_loader, task_model, optimizer, epoch, args)
+        print("=> creating model")
+        linear = nn.Sequential(
+            Normalize(),
+            nn.Linear(get_channels(args.arch), args.num_classes),
+        )
+        linear = linear.cuda()
 
-            # evaluate on validation set
-            if epoch % 10 == 0 or epoch == args.epochs-1:
-                acc1 = validate(task_model, val_loader, args)
-                # remember best acc@1 and save checkpoint
-                best_acc1 = max(acc1, best_acc1)
-
-                save_checkpoint({
-                    'epoch': epoch + 1,
-                    'state_dict': task_model.state_dict(),
-                    'best_acc1': best_acc1,
-                    'optimizer' : optimizer.state_dict(),
-                }, '{}_{}_{}.pth.tar'.format(args.name, args.dataset, split))
-            
-            lr_scheduler.step()
-            print('LR: {:f}'.format(lr_scheduler.get_last_lr()[-1]))    
-
-        print('Final accuracy of {} labeled data is: {:.2f}'.format(split, acc1))
-
-        print("=> creating model from scratch for the new split ...")
-        task_model = models.__dict__[args.arch](num_classes=args.num_classes)
-        task_model = torch.nn.DataParallel(task_model).cuda()
-
-        args.start_epoch = 0
-        optimizer = torch.optim.SGD(task_model.parameters(), args.lr,
-                                    momentum=args.momentum,
-                                    weight_decay=args.weight_decay)
-        
+        # optimizer = torch.optim.SGD(linear.parameters(),
+        #                             args.lr,
+        #                             momentum=args.momentum,
+        #                             weight_decay=args.weight_decay)
+        optimizer = torch.optim.Adam(linear.parameters(),
+                                        args.lr
+                                        )
+        sched = [int(x) for x in args.lr_schedule.split(',')]
         lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
             optimizer, milestones=sched
         )
 
+        cudnn.benchmark = True
+        print('Training task model started ...')
+        for epoch in range(args.start_epoch, args.epochs):
+            # train for one epoch
+            train(train_loader, backbone, linear, optimizer, epoch, args)
+
+            # evaluate on validation set
+            if epoch % args.print_freq == 0 or epoch == args.epochs-1:
+                acc1 = validate(val_loader, backbone, linear, args)
+
+            # modify lr
+            lr_scheduler.step()
+            print('LR: {:f}'.format(lr_scheduler.get_last_lr()[-1]))
+            
+        print('Final accuracy of {} unlabeled data is: {}'.format(split, acc1))
 
 
-def train(train_loader, task_model, optimizer, epoch, args):
+class Normalize(nn.Module):
+    def forward(self, x):
+        return x / x.norm(2, dim=1, keepdim=True)
+
+
+class FullBatchNorm(nn.Module):
+    def __init__(self, var, mean):
+        super(FullBatchNorm, self).__init__()
+        self.register_buffer('inv_std', (1.0 / torch.sqrt(var + 1e-5)))
+        self.register_buffer('mean', mean)
+
+    def forward(self, x):
+        return (x - self.mean) * self.inv_std
+
+
+def get_channels(arch):
+    if arch == 'alexnet':
+        c = 4096
+    elif arch == 'pt_alexnet':
+        c = 4096
+    elif arch == 'resnet50':
+        c = 2048
+    elif arch == 'resnet18':
+        c = 512
+    elif arch == 'mobilenet':
+        c = 1280
+    elif arch == 'resnet50x5_swav':
+        c = 10240
+    else:
+        raise ValueError('arch not found: ' + arch)
+    return c
+
+
+def train(train_loader, backbone, linear, optimizer, epoch, args):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
@@ -321,12 +455,12 @@ def train(train_loader, task_model, optimizer, epoch, args):
         [batch_time, data_time, losses, top1, top5],
         prefix="Epoch: [{}]".format(epoch))
 
-    task_model.train()
+    # switch to train mode
+    backbone.eval()
+    linear.train()
 
     end = time.time()
-
     for i, (images, target, _) in enumerate(train_loader):
-        
         # measure data loading time
         data_time.update(time.time() - end)
 
@@ -334,7 +468,9 @@ def train(train_loader, task_model, optimizer, epoch, args):
         target = target.cuda(non_blocking=True)
 
         # compute output
-        output = task_model(images)
+        with torch.no_grad():
+            output = backbone(images)
+        output = linear(output)
         loss = F.cross_entropy(output, target)
 
         # measure accuracy and record loss
@@ -343,7 +479,7 @@ def train(train_loader, task_model, optimizer, epoch, args):
         top1.update(acc1[0], images.size(0))
         top5.update(acc5[0], images.size(0))
 
-        # compute gradient and do SGD step
+        # compute gradient and do step
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -356,7 +492,7 @@ def train(train_loader, task_model, optimizer, epoch, args):
             progress.display(i)
 
 
-def validate(task_model, val_loader, args):
+def validate(val_loader, backbone, linear, args):
     batch_time = AverageMeter('Time', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
     top1 = AverageMeter('Acc@1', ':6.2f')
@@ -366,8 +502,8 @@ def validate(task_model, val_loader, args):
         [batch_time, losses, top1, top5],
         prefix='Test: ')
 
-    # switch to evaluate mode
-    task_model.eval()
+    backbone.eval()
+    linear.eval()
 
     with torch.no_grad():
         end = time.time()
@@ -376,7 +512,8 @@ def validate(task_model, val_loader, args):
             target = target.cuda(non_blocking=True)
 
             # compute output
-            output = task_model(images)
+            output = backbone(images)
+            output = linear(output)
             loss = F.cross_entropy(output, target)
 
             # measure accuracy and record loss
@@ -392,16 +529,49 @@ def validate(task_model, val_loader, args):
             if i % args.print_freq == 0:
                 progress.display(i)
 
-        # TODO: this should also be done with the ProgressMeter
         print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
               .format(top1=top1, top5=top5))
 
     return top1.avg
 
-    
-def save_checkpoint(state, filename='checkpoint.pth.tar'):
-    torch.save(state, filename)
 
+def normalize(x):
+    return x / x.norm(2, dim=1, keepdim=True)
+
+
+def get_feats(dataset, loader, model, args):
+    if args.backbone == "compress":
+        cached_feats = '{}/inference_feats_{}_compress18_swAVTeacher.pth.tar'.format(args.save, dataset)
+    elif args.backbone == "moco":
+        cached_feats = '{}/inference_feats_{}_moco.pth.tar'.format(args.save, dataset)
+
+    if args.load_cache and os.path.exists(cached_feats):
+        print(f'=> loading inference feats of {dataset} from cache: {cached_feats}')
+        return torch.load(cached_feats)
+    else:
+        print('get inference feats =>')
+
+        model.eval()
+        feats, labels, ptr = None, None, 0
+
+        with torch.no_grad():
+            for images, target, _ in tqdm(loader):
+                images = images.cuda(non_blocking=True)
+                cur_targets = target.cpu()
+                cur_feats = normalize(model(images)).cpu()
+                B, D = cur_feats.shape
+                inds = torch.arange(B) + ptr
+
+                if not ptr:
+                    feats = torch.zeros((len(loader.dataset), D)).float()
+                    labels = torch.zeros(len(loader.dataset)).long()
+
+                feats.index_copy_(0, inds, cur_feats)
+                labels.index_copy_(0, inds, cur_targets)
+                ptr += B
+
+        torch.save((feats, labels), cached_feats)
+        return feats, labels
 
 class AverageMeter(object):
     """Computes and stores the average and current value"""
@@ -443,6 +613,7 @@ class ProgressMeter(object):
         fmt = '{:' + str(num_digits) + 'd}'
         return '[' + fmt + '/' + fmt.format(num_batches) + ']'
 
+
 def accuracy(output, target, topk=(1,)):
     """Computes the accuracy over the k top predictions for the specified values of k"""
     with torch.no_grad():
@@ -459,6 +630,8 @@ def accuracy(output, target, topk=(1,)):
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
 
+def save_checkpoint(state, filename='checkpoint.pth.tar'):
+    torch.save(state, filename)
 
 if __name__ == '__main__':
     main()

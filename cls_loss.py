@@ -94,13 +94,15 @@ def CB_loss(labels, logits, samples_per_cls, no_of_classes, loss_type, beta):
         cb_loss = F.binary_cross_entropy_with_logits(input = logits,target = labels_one_hot, weights = weights)
     elif loss_type == "softmax":
         logits = logits.softmax(dim=1)
-        cb_loss = F.cross_entropy(input=logits, target=labels_one_hot, weight=weights)
+        loss_fn = nn.CrossEntropyLoss(reduction='none')
+        cb_loss = loss_fn(logits, labels_one_hot) * weights
+        # cb_loss = F.cross_entropy(input=logits, target=labels_one_hot, weight=weights)
         # loss_fn = torch.nn.CrossEntropyLoss(weight=init_weight)
         # loss_fn = torch.nn.CrossEntropyLoss(weight=weights)
         # logits = logit_adjustment(logits,[x / sum(samples_per_cls) for x in samples_per_cls],1.0)
         # cb_loss = loss_fn(input=logits, target=labels_one_hot)
         # cb_loss = loss_fn(input=logits, target=labels)
-    return cb_loss
+    return cb_loss.mean()
 
 def logit_adjustment(
         outputs: torch.Tensor,
