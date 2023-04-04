@@ -281,6 +281,31 @@ def entropy(unlabeled_loader, unlabeled_indices, backbone, linear, budget):
 
     return unlabeled_indices[entropies.sort()[1][:budget]]
 
+def my_entropy(unlabeled_loader, unlabeled_indices, backbone, budget):
+    backbone.eval()
+    logits, ptr = None, 0
+
+    with torch.no_grad():
+        for images, _, _ in tqdm(unlabeled_loader, desc="unlabeled features extraction"):
+
+            images = images.cuda(non_blocking=True)
+
+            # compute output
+            cur_logits = backbone(images).cpu()
+            B, D = cur_logits.shape
+            inds = torch.arange(B) + ptr
+
+            if not ptr:
+                logits = torch.zeros((len(unlabeled_loader.dataset), D)).float()
+
+            logits.index_copy_(0, inds, cur_logits)
+            ptr += B
+
+    probs = F.softmax(logits, dim=1)
+
+    entropies = torch.sum(probs * torch.log(probs), dim=1)
+
+    return unlabeled_indices[entropies.sort()[1][:budget]]
 
 def normalize(x):
     return x / x.norm(2, dim=1, keepdim=True)
