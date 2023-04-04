@@ -2,6 +2,7 @@
 import argparse
 import os
 import random
+from re import split
 import smtplib
 import time
 
@@ -260,9 +261,15 @@ def main():
     init_tensorboard(args,writer)
     inference_feats, inference_labels = get_inference(args)
     val_loader = trainer_DP.get_val_loader(args.dataset, args)
-    init_module(init_args, val_loader, inference_feats, inference_labels,writer)
+
+    # 加载模型
+    print("=> creating model")
+    task_model = train_model.get_backbone_model(args)
+    task_model = torch.nn.DataParallel(task_model).cuda()
+
+    init_module(init_args, val_loader,inference_feats, inference_labels,task_model,writer)
     # 训练
-    main_work(args, val_loader, inference_feats, inference_labels,writer)
+    main_work(args, val_loader, inference_feats, inference_labels,task_model,writer)
     # 训练完成邮件通知我
     send_mail("{}-{}-{}-{}-{} 训练完成".format(
             args.beta,args.dataset,args.name,args.budget,time.asctime(time.localtime(time.time()))
@@ -294,12 +301,12 @@ def init_tensorboard(args,writer):
         writer.add_graph(backbone,torch.rand(128,3,28,28))
 
 # 随机取样初始训练
-def init_module(init_args, val_loader, inference_feats, inference_labels,writer):
+def init_module(init_args, val_loader, inference_feats, inference_labels,task_model,writer):
     print("init module start......")
     # 先random选出初始训练集
-    sampler_fc(init_args, inference_feats, inference_labels)
+    sampler_fc(init_args, inference_feats, inference_labels,task_model)
     # 初始训练
-    train_fc(init_args, val_loader,writer)
+    train_fc(init_args, val_loader,task_model,writer)
 
 
 def get_inference(args):
@@ -320,7 +327,7 @@ def get_inference(args):
     return inference_feats, inference_labels
 
 
-def sampler_fc(args, inference_feats, inference_labels):
+def sampler_fc(args, inference_feats, inference_labels,task_model):
     all_indices = np.arange(args.num_images)
 
     inference_loader = sampler.get_inference_loader(args.dataset, all_indices, args)
@@ -412,6 +419,12 @@ def sampler_fc(args, inference_feats, inference_labels):
             args,
         )
         current_indices = np.concatenate((current_indices, sampled_indices), axis=-1)
+    elif args.name == "entropy":
+        print("Query sampling with {} started ...".format(args.name))
+        # unlabeled_loader = trainer_DP.get_train_loader(args.dataset,unlabeled_indices,args)
+        unlabeled_loader = sampler.get_inference_loader(args.dataset,unlabeled_indices,args)
+        sampled_indices = strategies.my_entropy(unlabeled_loader, unlabeled_indices, task_model, args.splits)
+        current_indices = np.concatenate((current_indices, sampled_indices), axis=-1)
 
     else:
         raise NotImplementedError("Query sampling method is not implemented")
@@ -439,12 +452,24 @@ def sampler_fc(args, inference_feats, inference_labels):
         ),save_indices
     )
 
+def get_channels(arch):
+    if arch == 'alexnet':
+        c = 4096
+    elif arch == 'pt_alexnet':
+        c = 4096
+    elif arch == 'resnet50':
+        c = 2048
+    elif arch == 'resnet18':
+        c = 512
+    elif arch == 'mobilenet':
+        c = 1280
+    elif arch == 'resnet50x5_swav':
+        c = 10240
+    else:
+        raise ValueError('arch not found: ' + arch)
+    return 
 
-def train_fc(args, val_loader,writer):
-    # 加载模型
-    print("=> creating model")
-    task_model = train_model.get_backbone_model(args)
-    task_model = torch.nn.DataParallel(task_model).cuda()
+def train_fc(args, val_loader, task_model,writer):
 
     optimizer = torch.optim.SGD(
         task_model.parameters(),
@@ -459,68 +484,68 @@ def train_fc(args, val_loader,writer):
     )
 
     # 加载之前的模型参数
-    if args.resume:
-        if os.path.isfile(args.resume):
-            print("=> loading checkpoint '{}'".format(args.resume))
+    # if args.resume:
+    #     if os.path.isfile(args.resume):
+    #         print("=> loading checkpoint '{}'".format(args.resume))
 
-            checkpoint = torch.load(args.resume)
+    #         checkpoint = torch.load(args.resume)
 
-            args.start_epoch = checkpoint["epoch"]
-            best_acc1 = checkpoint["best_acc1"]
-            acc1 = checkpoint["best_acc1"]
-            task_model.load_state_dict(checkpoint['state_dict'])
-            optimizer.load_state_dict(checkpoint["optimizer"])
-            print(
-                "=> loaded checkpoint '{}' (epoch {})".format(
-                    args.resume, checkpoint["epoch"]
-                )
-            )
-        elif os.path.isfile(
-            "{}/{}_random_{}_{}.pth.tar".format(args.base_dir,args.beta,args.dataset, args.splits)
-        ):
-            print(
-                "=> loading checkpoint '{}/{}_random_{}_{}.pth.tar'".format(
-                args.base_dir,args.beta,args.dataset, args.splits)
-            )
+    #         args.start_epoch = checkpoint["epoch"]
+    #         best_acc1 = checkpoint["best_acc1"]
+    #         acc1 = checkpoint["best_acc1"]
+    #         task_model.load_state_dict(checkpoint['state_dict'])
+    #         optimizer.load_state_dict(checkpoint["optimizer"])
+    #         print(
+    #             "=> loaded checkpoint '{}' (epoch {})".format(
+    #                 args.resume, checkpoint["epoch"]
+    #             )
+    #         )
+    #     elif os.path.isfile(
+    #         "{}/{}_random_{}_{}.pth.tar".format(args.base_dir,args.beta,args.dataset, args.splits)
+    #     ):
+    #         print(
+    #             "=> loading checkpoint '{}/{}_random_{}_{}.pth.tar'".format(
+    #             args.base_dir,args.beta,args.dataset, args.splits)
+    #         )
 
-            checkpoint = torch.load(
-                "{}/{}_random_{}_{}.pth.tar".format(args.base_dir,args.beta,args.dataset, args.splits)
-            )
+    #         checkpoint = torch.load(
+    #             "{}/{}_random_{}_{}.pth.tar".format(args.base_dir,args.beta,args.dataset, args.splits)
+    #         )
 
-            args.start_epoch = checkpoint["epoch"]
-            best_acc1 = checkpoint["best_acc1"]
-            acc1 = checkpoint["best_acc1"]
-            task_model.load_state_dict(checkpoint["state_dict"])
-            optimizer.load_state_dict(checkpoint["optimizer"])
-            print(
-                "=> loaded checkpoint '{}' (epoch {})".format(
-                    args.resume, checkpoint["epoch"]
-                )
-            )
-    elif os.path.isfile(
-        "{}/{}_random_{}_{}.pth.tar".format(args.base_dir,args.beta,args.dataset, args.splits)
-    ):
-        print(
-            "=> loading checkpoint '{}/{}_random_{}_{}.pth.tar'".format(
-            args.base_dir,args.beta,args.dataset, args.splits)
-        )
+    #         args.start_epoch = checkpoint["epoch"]
+    #         best_acc1 = checkpoint["best_acc1"]
+    #         acc1 = checkpoint["best_acc1"]
+    #         task_model.load_state_dict(checkpoint["state_dict"])
+    #         optimizer.load_state_dict(checkpoint["optimizer"])
+    #         print(
+    #             "=> loaded checkpoint '{}' (epoch {})".format(
+    #                 args.resume, checkpoint["epoch"]
+    #             )
+    #         )
+    # elif os.path.isfile(
+    #     "{}/{}_random_{}_{}.pth.tar".format(args.base_dir,args.beta,args.dataset, args.splits)
+    # ):
+    #     print(
+    #         "=> loading checkpoint '{}/{}_random_{}_{}.pth.tar'".format(
+    #         args.base_dir,args.beta,args.dataset, args.splits)
+    #     )
 
-        checkpoint = torch.load(
-            "{}/{}_random_{}_{}.pth.tar".format(args.base_dir,args.beta,args.dataset, args.splits)
-        )
+    #     checkpoint = torch.load(
+    #         "{}/{}_random_{}_{}.pth.tar".format(args.base_dir,args.beta,args.dataset, args.splits)
+    #     )
 
-        args.start_epoch = checkpoint["epoch"]
-        best_acc1 = checkpoint["best_acc1"]
-        acc1 = checkpoint["best_acc1"]
-        task_model.load_state_dict(checkpoint["state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer"])
-        print(
-            "=> loaded checkpoint '{}/{}_random_{}_{}.pth.tar' (epoch {})".format(
-                args.base_dir,args.beta,args.dataset, args.splits, checkpoint["epoch"]
-            )
-        )
-    else:
-        print("=> no checkpoint found at '{}'".format(args.resume))
+    #     args.start_epoch = checkpoint["epoch"]
+    #     best_acc1 = checkpoint["best_acc1"]
+    #     acc1 = checkpoint["best_acc1"]
+    #     task_model.load_state_dict(checkpoint["state_dict"])
+    #     optimizer.load_state_dict(checkpoint["optimizer"])
+    #     print(
+    #         "=> loaded checkpoint '{}/{}_random_{}_{}.pth.tar' (epoch {})".format(
+    #             args.base_dir,args.beta,args.dataset, args.splits, checkpoint["epoch"]
+    #         )
+    #     )
+    # else:
+    #     print("=> no checkpoint found at '{}'".format(args.resume))
 
     best_acc1 = 0
 
@@ -569,36 +594,12 @@ def train_fc(args, val_loader,writer):
         train(train_loader, task_model, optimizer, epoch, args,writer,plt_train_save)
 
         # 验证模型
-        # if epoch % 10 == 0 or epoch == args.epochs - 1:
-        acc1 = validate(task_model, val_loader, args,writer,epoch,plt_test_save)
         
-        if acc1 > best_acc1:
-            # 保存模型参数
-            best_acc1 = max(acc1, best_acc1)
-            es = 0
-            trainer_DP.save_checkpoint(
-                {
-                    "epoch": epoch + 1,
-                    "state_dict": task_model.state_dict(),
-                    "best_acc1": best_acc1,
-                    "optimizer": optimizer.state_dict(),
-                },
-                "{}/{}_{}_{}_{}.pth.tar".format(args.base_dir,args.beta,args.name, args.dataset, args.start_budget),
-            )
-        else: 
-            es += 1
-            print("Counter {} of {}".format(es,args.stop_count))
-
-            if es >= args.stop_count:
-                print("Early stopping with best_acc: {} and val_acc for this epoch: {} ...".format(best_acc1,acc1))
-                break
-        # lr_scheduler.step()
-        # print("LR: {:f}".format(lr_scheduler.get_last_lr()[-1]))
-    
+    acc1 = validate(task_model, val_loader)
     plt_train_save.save(args,"train")
     plt_test_save.save(args,"test")
 
-    print("Final accuracy of {} labeled data is: {:.2f}".format(args.start_budget, best_acc1))
+    print("Final accuracy of {} labeled data is: {:.2f}".format(args.start_budget, acc1))
 
 
 def train(train_loader, task_model, optimizer, epoch, args,writer,plt_save):
@@ -632,34 +633,13 @@ def train(train_loader, task_model, optimizer, epoch, args,writer,plt_save):
         if args.common:
             # loss_fn = torch.nn.CrossEntropyLoss()
             # loss = loss_fn(output, target)
-            labels_one_hot = F.one_hot(target.long(), args.num_classes).float()
-            labels_one_hot = labels_one_hot.cuda(non_blocking=True)
-            loss_fn = torch.nn.CrossEntropyLoss()
-            loss = loss_fn(input=output,target=labels_one_hot)
+            loss = F.cross_entropy(output,target)
         else:   
-            temp = torch.unique(target, return_counts=True)
-            target_list = [] 
-            index = 0
-            for j in range(args.num_classes):
-                if len(temp[0]) > index and temp[0][index] == j:
-                    target_list.append(temp[1][index])
-                    index = index + 1
-                else:
-                    target_list.append(0)
+            temp = torch.unique(target.cpu(), return_counts=True)
+            samples_per_cls = np.zeros(args.num_classes)
+            samples_per_cls[temp[0]] = samples_per_cls[temp[0]] + temp[1].numpy()
 
-            samples_per_cls = torch.tensor(target_list)
-
-            samples_per_cls = samples_per_cls.data.cpu()
-
-            loss = CB_loss(target,output,samples_per_cls,args.num_classes,'softmax',args.beta)
-            # loss = cb_(target.cpu().detach().numpy(), output.cpu().detach().numpy(),samples_per_cls,args.num_classes,args.beta)
-            # effective_num = 1.0 - np.power(args.beta, samples_per_cls)
-            # effective_num = np.array(effective_num)
-            # effective_num = np.maximum(effective_num, np.finfo(np.float32).eps)
-            # weights = (1.0 - args.beta) / effective_num
-            # weights = weights / np.sum(weights) * args.num_classes
-
-            # loss = F.cross_entropy(output,target,torch.tensor(weights,dtype=torch.float).cuda(non_blocking=True))
+            loss = CB_loss(target,output,samples_per_cls,len(samples_per_cls),'softmax',args.beta)
 
 
         # 计算 accuracy 和 记录 loss,losses,top1,top5
@@ -696,7 +676,7 @@ def train(train_loader, task_model, optimizer, epoch, args,writer,plt_save):
             progress.display(i)
 
 
-def validate(task_model, val_loader, args, writer, epoch,plt_save):
+def validate(task_model, val_loader):
     batch_time = trainer_DP.AverageMeter('Time', ':6.3f')
     losses = trainer_DP.AverageMeter('Loss', ':.4e')
     top1 = trainer_DP.AverageMeter('Acc@1', ':6.2f')
@@ -718,76 +698,24 @@ def validate(task_model, val_loader, args, writer, epoch,plt_save):
              # 计算output
             output = task_model(images)
 
-            loss = None
-            if args.common:
-                # loss = F.cross_entropy(output, target)
-                labels_one_hot = F.one_hot(target.long(), args.num_classes).float()
-                labels_one_hot = labels_one_hot.cuda(non_blocking=True)
-                loss_fn = torch.nn.CrossEntropyLoss()
-                loss = loss_fn(input=output,target=labels_one_hot)
-            else:
-                temp = torch.unique(target, return_counts=True)
-                target_list = []
-                index = 0
-                for j in range(args.num_classes):
-                    if len(temp[0]) > index and temp[0][index] == j:
-                        target_list.append(temp[1][index])
-                        index = index + 1
-                    else:
-                        target_list.append(0)
-
-                samples_per_cls = torch.tensor(target_list)
-
-                samples_per_cls = samples_per_cls.data.cpu()
-
-
-                loss = CB_loss(target,output,samples_per_cls,args.num_classes,'softmax',args.beta)
-                # loss = cb_(target.cpu().detach().numpy(), output.cpu().detach().numpy(),samples_per_cls,args.num_classes,args.beta)
-                # loss = loss.numpy()
-                # loss = torch.tensor(loss,device='cuda')
-                # effective_num = 1.0 - np.power(args.beta, samples_per_cls)
-                # effective_num = np.array(effective_num)
-                # effective_num = np.maximum(effective_num, np.finfo(np.float32).eps)
-                # weights = (1.0 - args.beta) / effective_num
-                # weights = weights / np.sum(weights) * args.num_classes
-
-                # loss = F.cross_entropy(output,target,torch.tensor(weights,dtype=torch.float).cuda(non_blocking=True))
-            
-            # 计算 accuracy 和 记录 loss,losses,top1,top5
             acc1, acc5 = trainer_DP.accuracy(output, target, topk=(1, 5))
-            losses.update(loss.item(), images.size(0))
+            # losses.update(loss.item(), images.size(0))
             top1.update(acc1[0], images.size(0))
             top5.update(acc5[0], images.size(0))
-
-            plt_save.update(loss.item(),loss.sum().item(),top1.avg.item(),top5.avg.item())
-
-            writer.add_scalars("{}_{}_{}_{}_{}_test_loss".format(
-                args.beta,args.dataset,args.name,args.splits,args.start_budget), 
-                {'loss':loss},epoch)
-            writer.add_scalars("{}_{}_{}_{}_{}_total_test_losse".format(
-                args.beta,args.dataset,args.name,args.splits,args.start_budget),
-                {'losses':torch.tensor([losses.sum])},epoch)
-            writer.add_scalars("{}_{}_{}_{}_{}_test_acc1".format(
-                args.beta,args.dataset,args.name,args.splits,args.start_budget),
-                {'acc1':torch.tensor([top1.avg])},epoch)
-            writer.add_scalars("{}_{}_{}_{}_{}_test_acc".format(
-                args.beta,args.dataset,args.name,args.splits,args.start_budget),
-                {'acc5':torch.tensor([top5.avg])},epoch)
             
              # 计算导数和SGDstep
             batch_time.update(time.time() - end)
             end = time.time()
 
-            if i % args.print_freq == 0:
+            if i % 10 == 0:
                 progress.display(i)
-
         print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
               .format(top1=top1, top5=top5))
 
     return top1.avg
 
 
-def main_work(args, val_loader, inference_feats, inference_labels,writer):
+def main_work(args, val_loader, inference_feats, inference_labels,task_model,writer):
     print("start main train......")
     while args.budget > args.start_budget:
         print("{} train action......".format(args.start_budget/args.splits))
@@ -796,13 +724,13 @@ def main_work(args, val_loader, inference_feats, inference_labels,writer):
         args.resume_indices = "{}/{}/{}_{}_{}_{}.npy".format(
             args.base_dir,args.indices,args.beta, args.name, args.dataset, args.start_budget-args.splits
         )
-        sampler_fc(args, inference_feats, inference_labels)
+        sampler_fc(args, inference_feats, inference_labels,task_model)
 
-        args.resume = "{}/{}_{}_{}_{}.pth.tar".format(
-            args.base_dir,args.beta,args.name, args.dataset, args.start_budget-args.splits
-        )
+        # args.resume = "{}/{}_{}_{}_{}.pth.tar".format(
+        #     args.base_dir,args.beta,args.name, args.dataset, args.start_budget-args.splits
+        # )
         # 训练模型
-        train_fc(args, val_loader,writer)
+        train_fc(args, val_loader,task_model,writer)
         
 
 
