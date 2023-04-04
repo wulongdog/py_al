@@ -76,8 +76,8 @@ def CB_loss(labels, logits, samples_per_cls, no_of_classes, loss_type, beta):
     labels_one_hot = F.one_hot(labels.long(), no_of_classes).float()
     labels_one_hot = labels_one_hot.cuda(non_blocking=True)
 
-    init_weight = torch.tensor(weights,dtype=torch.float)
-    init_weight = init_weight.cuda(non_blocking=True)
+    # init_weight = torch.tensor(weights,dtype=torch.float)
+    # init_weight = init_weight.cuda(non_blocking=True)
 
     weights = torch.tensor(weights,dtype=torch.float)
 
@@ -94,15 +94,8 @@ def CB_loss(labels, logits, samples_per_cls, no_of_classes, loss_type, beta):
         cb_loss = F.binary_cross_entropy_with_logits(input = logits,target = labels_one_hot, weights = weights)
     elif loss_type == "softmax":
         logits = logits.softmax(dim=1)
-        loss_fn = nn.CrossEntropyLoss(reduction='none')
-        cb_loss = loss_fn(logits, labels_one_hot) * weights
-        # cb_loss = F.cross_entropy(input=logits, target=labels_one_hot, weight=weights)
-        # loss_fn = torch.nn.CrossEntropyLoss(weight=init_weight)
-        # loss_fn = torch.nn.CrossEntropyLoss(weight=weights)
-        # logits = logit_adjustment(logits,[x / sum(samples_per_cls) for x in samples_per_cls],1.0)
-        # cb_loss = loss_fn(input=logits, target=labels_one_hot)
-        # cb_loss = loss_fn(input=logits, target=labels)
-    return cb_loss.mean()
+        cb_loss = F.binary_cross_entropy(input=logits, target=labels_one_hot, weight=weights)
+    return cb_loss
 
 def logit_adjustment(
         outputs: torch.Tensor,
